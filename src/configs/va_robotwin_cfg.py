@@ -16,10 +16,8 @@ va_robotwin_cfg.height = 256
 va_robotwin_cfg.width = 320
 va_robotwin_cfg.action_dim = 30
 va_robotwin_cfg.action_per_frame = 16
-va_robotwin_cfg.obs_cam_keys = [
-    'observation.images.cam_high', 'observation.images.cam_left_wrist',
-    'observation.images.cam_right_wrist'
-]
+va_robotwin_cfg.obs_cam_keys = ['observation.images.cam_high', 'observation.images.cam_left_wrist',
+    'observation.images.cam_right_wrist']
 va_robotwin_cfg.guidance_scale = 5
 va_robotwin_cfg.action_guidance_scale = 1
 

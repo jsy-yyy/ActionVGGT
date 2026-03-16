@@ -109,11 +109,7 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
 
  
         # image_dict stores images as [B, C, F, H, W]; convert to [B, F, C, H, W]        
-        # If without batch dimension, add it
-        if len(images.shape) == 4:
-            images = images.unsqueeze(0)
-        if images.ndim == 5:
-            images = images.permute(0, 2, 1, 3, 4)
+        masked_images = masked_images.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
         # create views list for downstream heads/output
         B, F, C, H, W = images.shape
         views = [{"img": images[:, i]} for i in range(F)]
@@ -123,8 +119,6 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
             images=masked_images,
             actions=masked_actions,
             text_emb=text_emb,
-            image_mask=image_mask,
-            action_mask=action_mask,
             image_grid_id=image_grid_id,
             action_grid_id=action_grid_id,
         )
@@ -282,3 +276,11 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
         
         output = ActionVGGTOutput(ress=all_ress, views=processed_frames)
         return output
+    
+
+if __name__ == '__main__':
+    checkpoint_path = '../ckpt/checkpoints.pth'
+    model = ActionVGGT()
+    model.load_state_dict(torch.load(checkpoint_path), strict=False)
+    # Save the model
+    torch.save(model.state_dict(), '../ckpt/actionvggt.pth')

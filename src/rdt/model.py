@@ -40,7 +40,7 @@ class RDT(nn.Module):
             RDTBlock(layer_idx, config=config)
             for layer_idx in range(self.depth)
         ])
-        self.final_layer = FinalLayer(output_size, config=config)
+        # self.final_layer = FinalLayer(output_size, config=config)
 
         # Append learnable tokens to the input action sequence
         self.num_register_tokens = config.get(
@@ -142,10 +142,10 @@ class RDT(nn.Module):
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.ffn.fc2.weight, 0)
-        nn.init.constant_(self.final_layer.ffn.fc2.bias, 0)
+        # nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        # nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        # nn.init.constant_(self.final_layer.ffn.fc2.weight, 0)
+        # nn.init.constant_(self.final_layer.ffn.fc2.bias, 0)
 
         # Move all the params to given data type
         self.to(self.dtype)
@@ -229,7 +229,7 @@ class RDT(nn.Module):
                 # its per layer language condition
                 c = c[:, i]
             x = block(x, t, c, ck, cv, mask=mask)
-        x = self.final_layer(x, t)
+        # x = self.final_layer(x, t)
 
         # Unpack [x, r]
         x = x[:, :-self.num_register_tokens]

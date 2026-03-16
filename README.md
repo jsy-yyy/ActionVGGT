@@ -26,22 +26,24 @@ conda install 'llvm-openmp<16'
 ### Download Pretrained Checkpoints
 
 1. StreamVGGT: 
- -  [Hugging Face](https://huggingface.co/lch01/StreamVGGT/)
+ - [Hugging Face](https://huggingface.co/lch01/StreamVGGT/)
  - [Tsinghua cloud](https://cloud.tsinghua.edu.cn/d/d6ad8f36fcd541bcb246/)
+ - nas: `/mnt/nas/share/home/yds/actionvggt.pth`
 
 2. RDT:
  - [Hugging Face](https://huggingface.co/robotics-diffusion-transformer/RDT2-FM)
+ - nas: `/mnt/nas/share/home/yds/RDT.pth`
 
 ## Data Preparation
 ### Training Datasets
-The training dataset consist of six dataset in LeRobot dataset format, which is aligned with [Lingbot-VA](https://technology.robbyant.com/lingbot-va).
+Use robotwin dataset in LeRobot dataset format as training dataset, which is provide by [Lingbot-VA](https://technology.robbyant.com/lingbot-va).
 
-  - Agibot
-  - RoboMind
-  - InternData-A1
-  - OXE
-  - UMI Data
-  - RoboCOIN
+To download the dataset:
+```bash
+huggingface-cli download --repo-type dataset robbyant/robotwin-clean-and-aug-lerobot --local-dir /path/to/your/dataset
+```
+
+The dataset is also available in nas: `/mnt/nas/datasets5/robotwin_lerobot`
 
 ### Evaluation Datasets
 
@@ -63,7 +65,10 @@ StreamVGGT
 
 ## Training
 
-TODO
+To start training, run:
+```bash
+NGPU=8 bash script/run_va_posttrain.sh
+```
 
 
 ## Evaluation

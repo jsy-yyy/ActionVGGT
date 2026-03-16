@@ -74,7 +74,8 @@ class Aggregator(nn.Module):
         text_dim=4096,
     ):
         super().__init__()
-
+        self.image_height = img_height
+        self.image_width = img_width
         self.__build_patch_embed__(patch_embed, img_height, img_width, patch_size, num_register_tokens, embed_dim=embed_dim)
 
         # Initialize rotary position embedding if frequency > 0
@@ -259,19 +260,21 @@ class Aggregator(nn.Module):
             print(f"Use KV cache expects S=1, got S={S}")
 
         if C_in != 3:
-            raise ValueError(f"Expected 3 input channels, got {C_in}")
+            raise ValueError(f"Expected 3 input channels, got {C_in}. Image shape: {images.shape}")
 
         # Normalize images and reshape for patch embed
         images = (images - self._resnet_mean.to(images.device)) / self._resnet_std.to(images.device)
 
         # Reshape to [B*S, C, H, W] for patch embedding
-        images = images.reshape(B * S, C_in, H, W)
+        images = images.reshape(-1, C_in, self.image_height, self.image_width)
+        print(images.shape)
         patch_tokens = self.patch_embed(images)
 
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
         _, P, C = patch_tokens.shape
+        patch_tokens = patch_tokens.reshape(B * S, -1, C)
 
         # Process action tokens if provided
         action_vec = rearrange(actions, 'b c f h w -> b (f h w) c')

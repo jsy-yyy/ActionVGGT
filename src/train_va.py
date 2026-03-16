@@ -26,7 +26,7 @@ import json
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# from configs import VA_CONFIGS
+from configs import VA_CONFIGS
 from distributed.fsdp import shard_model, apply_ac
 from distributed.util import (
     _configure_model, 
@@ -56,10 +56,10 @@ import gc
 class Trainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
-            wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
+            # wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
             self.wandb = wandb
             self.wandb.init(
-                entity=os.environ["WANDB_TEAM_NAME"],
+                # entity=os.environ["WANDB_TEAM_NAME"],
                 project=os.getenv("WANDB_PROJECT", "va_robotwin"),
                 # dir=log_dir,
                 config=config,
@@ -71,6 +71,7 @@ class Trainer:
         self.step = 0
         self.config = config
         self.device = torch.device(f"cuda:{config.local_rank}")
+        # self.device = torch.device(f"cuda:0")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
 
@@ -90,8 +91,8 @@ class Trainer:
         patch_w = self.transformer.img_width // self.transformer.patch_size
         img_tokens_per_frame = patch_h * patch_w
         act_tokens_per_frame = 1
-        rdt_horizon = self.config.chunk_size + 1
-        rdt_x_pos_emb_config = [("act", rdt_horizon)]
+        rdt_horizon = self.config.chunk_size
+        rdt_x_pos_emb_config = [("act", rdt_horizon + self.config.rdt.num_register_tokens)]
         rdt_img_pos_emb_config = [("image", (self.config.window_size, patch_h, patch_w))]
         rdt_act_pos_emb_config = [("action", (self.config.window_size, act_tokens_per_frame))]
 
@@ -132,10 +133,8 @@ class Trainer:
             transformer_state = _load_checkpoint_state(transformer_resume_from)
             logger.info(self.transformer.load_state_dict(transformer_state, strict=False))
         elif transformer_pretrained:
-            if config.rank == 0:
-                logger.info(f"Loading ActionVGGT pretrained from: {transformer_pretrained}")
-            transformer_state = _load_checkpoint_state(transformer_pretrained)
-            logger.info(self.transformer.load_state_dict(transformer_state, strict=False))
+            logger.info(f"Loading ActionVGGT pretrained from: {transformer_pretrained}")
+            logger.info(self.transformer.load_state_dict(_load_checkpoint_state(transformer_pretrained), strict=False))
 
         # RDT action head loading: prefer resume_from, fallback to pretrained.
         action_head_resume_from = getattr(config, 'action_head_resume_from', None)
@@ -146,10 +145,8 @@ class Trainer:
             action_head_state = _load_checkpoint_state(action_head_resume_from)
             logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
         elif action_head_pretrained:
-            if config.rank == 0:
-                logger.info(f"Loading RDT action head pretrained from: {action_head_pretrained}")
-            action_head_state = _load_checkpoint_state(action_head_pretrained)
-            logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
+            logger.info(f"Loading RDT action head pretrained from: {action_head_pretrained}")
+            logger.info(self.action_head.load_state_dict(_load_checkpoint_state(action_head_pretrained), strict=False))
 
         logger.info("Setting up FSDP...")
         shard_fn = shard_model
@@ -173,6 +170,11 @@ class Trainer:
 
         self.action_head.train()
         self.action_head.requires_grad_(True)
+
+        # freeze
+        logger.info("Freezing patch embedding and positional encoding parameters...")
+        frozen_params = 0
+        total_params = 0
 
         frozen_param_names = []
 
@@ -303,8 +305,6 @@ class Trainer:
     @torch.no_grad()
     def _prepare_input_dict(self, batch_dict):
         """Prepare input dict following WAN-style structure but with raw images."""
-
-        data_timestep = batch_dict.get('data_timestep', None)
         window_size = getattr(self.config, 'window_size', None)
         chunk_size = getattr(self.config, 'chunk_size', None)
 
@@ -313,7 +313,30 @@ class Trainer:
             raise ValueError("batch_dict must include raw 'images' for ActionVGGT training")
 
         images = batch_dict['images']  # [B, C_image, F, H, W]
+        # cut image height and width to be divisible by patch size
+        # patch_f, patch_h, patch_w = self.patch_size
+        # H = (H // patch_h) * patch_h
+        # W = (W // patch_w) * patch_w
+        # images = images[:, :, :, :H, :W]
         B, _, F, H, W = images.shape
+        # Build action dict
+        actions = batch_dict["actions"] # [B, C_action, F, N, 1]
+        B, _, F, N, _ = actions.shape
+
+                # Use action frame nums as chunk_size, instead of image frames
+        min_t = max(window_size - 1, 0)
+        max_t = max(batch_dict['num_frames'] - (chunk_size + 1) // N, min_t)
+        if max_t < min_t:
+            data_timestep = min_t if F > 0 else 0
+        else:
+            data_timestep = torch.randint(min_t, max_t + 1, (B,)).to(self.device)
+
+        window_end = data_timestep + 1
+        image_mask = torch.zeros_like(images, dtype=torch.bool)
+        action_mask = torch.zeros_like(actions, dtype=torch.bool)
+        image_mask[:, :, :window_end] = True
+        action_mask[:, :, :window_end - 1] = True
+
 
         # Build grid_id for image tokens using 3D mesh (F, H//p, W//p)
         patch_f, patch_h, patch_w = self.patch_size
@@ -332,12 +355,8 @@ class Trainer:
             images=images,
             grid_id=image_grid_id,
             text_emb=batch_dict.get('text_emb', None),
-            images_mask=batch_dict.get('images_mask', None),
+            images_mask=image_mask,
         )
-
-        # Build action dict
-        actions = batch_dict["actions"] # [B, C_action, F, N, 1]
-        B, _, F, N, _ = actions.shape
 
         # Replace action grid_id to align with action token RoPE (one token per frame)
         action_grid_id = get_mesh_id(
@@ -355,13 +374,14 @@ class Trainer:
             actions=actions,
             grid_id=action_grid_id,
             text_emb=batch_dict.get('text_emb', None),
-            action_mask = batch_dict.get('actions_mask', None),
+            action_mask = action_mask,
         )
 
         # Build noised action chunks
-        action_chunk_start_idx = data_timestep
-        action_chunk_end_idx = min(data_timestep + chunk_size, F)
-        action_chunk = actions[:, :, action_chunk_start_idx:action_chunk_end_idx]  # [B, C_action, chunk_size, N, 1]
+        action_chunk_start_idx = data_timestep * N + 1
+        action_chunk_end_idx = min(action_chunk_start_idx + chunk_size, F)
+        action_chunk = rearrange(actions, 'b c f n 1 -> b c (f n)')[:, :, action_chunk_start_idx:action_chunk_end_idx]  # [B, C_action, chunk_size]
+        action_chunk = rearrange(action_chunk, 'b c f -> b c f 1 1')  # [B, C_action, chunk_size, 1, 1]
         action_chunk_dict = self._add_noise(
             action_chunk,
             train_scheduler=self.train_scheduler_action,
@@ -369,6 +389,8 @@ class Trainer:
             action_mode=True,
         )
         action_chunk_dict["pred_frame_idx"] = data_timestep
+        action_chunk_dict['targets'] = rearrange(action_chunk_dict['targets'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
+        action_chunk_dict['noisy_latents'] = rearrange(action_chunk_dict['noisy_latents'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
 
         input_dict = {
             'image_dict': image_dict,
@@ -392,18 +414,18 @@ class Trainer:
 
     def compute_loss(self, input_dict, pred):
         action_pred = pred
-        action_pred = rearrange(action_pred, 'b (f n) c -> b c f n 1', f=input_dict['action_dict']['targets'].shape[-3])
+        action_pred = rearrange(action_pred, 'b f c -> b c f')
         Bn, Fn = input_dict['latent_dict']['timesteps'].shape
         action_loss_weight = self.train_scheduler_action.training_weight(input_dict['action_dict']['timesteps'].flatten()).reshape(Bn, Fn)
 
         # Frame-wise action loss calculation
         action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')
-        action_loss = action_loss * action_loss_weight[:, None, :, None, None]
+        action_loss = action_loss * action_loss_weight[:, None, :]
         # action_loss = action_loss * input_dict['action_dict']['actions_mask'].float()
         # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
-        action_loss = action_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
+        action_loss = action_loss.permute(0, 2, 1)  # (B, C, F) -> (B, F, C)
         # action_mask = input_dict['action_dict']['actions_mask'].float().permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-        action_loss = action_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
+        action_loss = action_loss.flatten(0, 1).flatten(1)  # (B, F, C) -> (B*F, C)
         # action_mask = action_mask.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
         # Sum per frame and normalize by mask per frame
         action_loss_per_frame = action_loss.sum(dim=1)  # (B*F,)
@@ -485,9 +507,9 @@ class Trainer:
             output = self.transformer(input_dict)
             rdt_conds = output.ress
 
-            action_chunk = input_dict['pred_action_chunk_dict']['noisy_latents']  # [B, C_action, chunk_size, N, 1]
-            action_chunk = action_chunk.squeeze(-1).permute(0, 2, 3, 1).reshape(action_chunk.shape[0], -1, action_chunk.shape[1]) # [B, chunk_size*N, C_action]
-            action_chunk_emb = self.action_head.action_embedder(action_chunk)  # [B, chunk_size*N, embed_dim]
+            action_chunk = input_dict['pred_action_chunk_dict']['noisy_latents']  # [B, C_action, chunk_size]
+            action_chunk = action_chunk.permute(0, 2, 1) # [B, chunk_size, C_action]
+            action_chunk_emb = self.action_head.action_embedder(action_chunk)  # [B, chunk_size, embed_dim]
             timesteps = input_dict['pred_action_chunk_dict']['timesteps'][:, 0]
 
             action_pred = self.action_head(
@@ -497,7 +519,7 @@ class Trainer:
                 act_c=rdt_conds['rdt_act_c'],
             )
 
-            action_pred = self.action_head.action_decoder(action_pred) # [B, chunk_size*N, C_action]
+            action_pred = self.action_head.action_decoder(action_pred) # [B, chunk_size, C_action]
 
             action_loss = self.compute_loss(input_dict, action_pred)
             loss = action_loss
@@ -675,6 +697,7 @@ class Trainer:
         logger.info(f"Starting training for {self.config.num_steps} steps...")
 
         while self.step < self.config.num_steps:
+            logger.info(f"Starting epoch at step {self.step}...")
             self.train_epoch()
             if dist.is_initialized():
                 dist.barrier()
@@ -682,7 +705,9 @@ class Trainer:
         logger.info("Training completed!")
 
 
-def run(config):
+def run(args): 
+    """Main entry point."""
+    config = VA_CONFIGS[args.config_name]
 
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
@@ -694,11 +719,11 @@ def run(config):
     config.local_rank = local_rank
     config.world_size = world_size
 
-    # if args.save_root is not None:
-    #     config.save_root = args.save_root
+    if args.save_root is not None:
+        config.save_root = args.save_root
 
     if rank == 0:
-        logger.info(f"Using config: {config.config_name}")
+        logger.info(f"Using config: {args.config_name}")
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
 
     trainer = Trainer(config)

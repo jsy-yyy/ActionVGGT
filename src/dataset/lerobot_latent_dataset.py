@@ -38,7 +38,7 @@ def construct_lerobot(
     )
 
 def construct_lerobot_multi_processor(config, 
-                                      num_init_worker=8,
+                                      num_init_worker=128,
                                       ):
     datasets_out_lst = []
     construct_func = partial(
@@ -47,8 +47,11 @@ def construct_lerobot_multi_processor(config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
     repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
+    repo_list = repo_list[:10]
     with Pool(num_init_worker) as pool:
         datasets_out_lst = pool.map(construct_func, repo_list)
+    # for repo in repo_list:
+    #     datasets_out_lst.append(construct_func(repo))
                 
     return datasets_out_lst
 
@@ -142,10 +145,12 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
         
         self.latent_path = Path(repo_id) / 'latents'
+        self.image_path = Path(repo_id) / 'videos'
         self.empty_emb = torch.load(config.empty_emb_path, weights_only=False)
         self.config = config
         self.cfg_prob = config.cfg_prob
         self.used_video_keys = config.obs_cam_keys
+        self.image_height, self.image_width = config.image_height, config.image_width
         self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
         self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
         self._hf_torch_view = self.hf_dataset.with_format(
@@ -220,6 +225,59 @@ class LatentLeRobotDataset(LeRobotDataset):
             out[key] = latent_data
         
         return self._flatten_latent_dict(out)
+
+    def _get_range_image_data(self, start_frame, end_frame, episode_index):
+        episode_chunk = self.meta.get_episode_chunk(episode_index)
+        image_path = Path(self.image_path) / f"chunk-{episode_chunk:03d}"
+        latent_path = Path(self.latent_path) / f"chunk-{episode_chunk:03d}"
+        out = {}
+        for key in self.used_video_keys:
+            cur_path = image_path / key
+            image_file = (
+                cur_path / f"episode_{episode_index:06d}.mp4"
+            )
+            assert os.path.exists(image_file)
+            # Load image_data from mp4 file as a tensor of shape [F, H, W, C].
+            try:
+                import av
+                with av.open(str(image_file)) as container:
+                    frames = [
+                        frame.to_ndarray(format='rgb24')
+                        for frame in container.decode(video=0)
+                    ]
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to decode video {image_file}. "
+                    "OpenCV and PyAV both failed."
+                ) from e
+
+            image_data = torch.from_numpy(np.stack(frames)).float() / 255.0
+            image_data = image_data[start_frame:end_frame]
+            num_frames, height, width, channels = image_data.shape
+
+            if num_frames == 0:
+                raise RuntimeError(
+                    f"Empty frame slice [{start_frame}:{end_frame}] for {image_file}. "
+                    "Check action segment boundaries versus available frames."
+                )
+            
+            cur_path = latent_path / key
+            latent_file = (
+                cur_path / f"episode_{episode_index:06d}_{start_frame}_{end_frame}.pth"
+            )
+            assert os.path.exists(latent_file)
+            latent_data = torch.load(latent_file, weights_only=False)
+
+            out[key] = {
+                "video": image_data.reshape(num_frames * height * width, channels),
+                "video_num_frames": num_frames,
+                "video_height": height,
+                "video_width": width,
+                "frame_ids": torch.arange(start_frame, end_frame, dtype=torch.long),
+                "text_emb": latent_data.get("text_emb", None)
+            }
+        
+        return self._flatten_latent_dict(out)
     
         
     def _cat_video_latents(self,
@@ -250,17 +308,71 @@ class LatentLeRobotDataset(LeRobotDataset):
         )
         return out_dict
     
-    def _action_post_process(self, local_start_frame, local_end_frame, latent_frame_ids, action):
-        act_shift = int(latent_frame_ids[0] - local_start_frame)
-        frame_stride = latent_frame_ids[1] - latent_frame_ids[0]
+    def _cat_video_images(self,
+                          data_dict):
+        image_lst = []
+        for key in self.used_video_keys:
+            image = data_dict[f"{key}.video"]
+            image_num_frames = data_dict[f"{key}.video_num_frames"]
+            image_height = data_dict[f"{key}.video_height"]
+            image_width = data_dict[f"{key}.video_width"]
+            image = rearrange(image, 
+                                 '(f h w) c -> f c h w ', 
+                                 f= image_num_frames, 
+                                 h= image_height, 
+                                 w= image_width)
+            # downsample image frames to frames/4
+            image = image[::4]
+            # resize and padding image to self.image_height and self.image_width, Does not distort the image content
+            import torch.nn.functional as F
+
+            # Resize and pad image to self.image_height and self.image_width without distortion
+            # image: [num_frames * image_height * image_width, channels] -> [num_frames, channels, image_height, image_width]
+            num_frames = image_num_frames
+            c = image.shape[1]
+            h = image_height
+            w = image_width
+
+            # Compute scale factor to fit within target size
+            scale = min(self.image_height / h, self.image_width / w)
+            new_h = int(round(h * scale))
+            new_w = int(round(w * scale))
+
+            # Resize
+            image = F.interpolate(image, size=(new_h, new_w), mode='bilinear', align_corners=False)
+
+            # Pad to target size
+            pad_h = self.image_height - new_h
+            pad_w = self.image_width - new_w
+            pad_top = pad_h // 2
+            pad_bottom = pad_h - pad_top
+            pad_left = pad_w // 2
+            pad_right = pad_w - pad_left
+            image = F.pad(image, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
+            image_lst.append(image)
+
+        cat_image = torch.cat(image_lst, dim=2) # [f, c, 3*h, w]
+        text_emb = data_dict[f"{self.used_video_keys[0]}.text_emb"]
+        if torch.rand(1).item() < self.cfg_prob:
+            text_emb = self.empty_emb
+
+        out_dict = dict(
+            images = cat_image,
+            text_emb = text_emb,
+        )
+        return out_dict
+    
+    def _action_post_process(self, local_start_frame, local_end_frame, image_frame_ids, action):
+        act_shift = int(image_frame_ids[0] - local_start_frame)
+        frame_stride = image_frame_ids[1] - image_frame_ids[0]
         action = action[act_shift:]
         left_action = get_relative_pose(action[:, :7])
         right_action = get_relative_pose(action[:, 8:15])
         action = np.concatenate([left_action, action[:, 7:8], right_action, action[:, 15:16]], axis=1)
         action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
 
-        latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1
-        required_action_num = latent_frame_num * frame_stride * 4
+        image_frame_num = (len(image_frame_ids) - 1) // 4 + 1
+        required_action_num = image_frame_num * frame_stride * 4
 
         action = action[:required_action_num]
         action_mask = np.ones_like(action, dtype='bool')
@@ -274,8 +386,8 @@ class LatentLeRobotDataset(LeRobotDataset):
         action_mask_aligned = action_mask_padded[:, self.config.inverse_used_action_channel_ids]
         action_aligned = (action_aligned - self.q01) / (
                 self.q99 - self.q01 + 1e-6) * 2. - 1.
-        action_aligned = rearrange(action_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
-        action_mask_aligned = rearrange(action_mask_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
+        action_aligned = rearrange(action_aligned, "(f n) c -> c f n 1", f=image_frame_num)
+        action_mask_aligned = rearrange(action_mask_aligned, "(f n) c -> c f n 1", f=image_frame_num)
         action_aligned *= action_mask_aligned
         return torch.from_numpy(action_aligned).float(), torch.from_numpy(action_mask_aligned).bool()
 
@@ -284,11 +396,9 @@ class LatentLeRobotDataset(LeRobotDataset):
         Arguments:
             idx: int, the index of the data item to retrieve. The dataset will be indexed
         Returns:            A dictionary containing the following keys:
-                - 'images': Tensor of shape [C, F, H, W], the raw video frames.
+                - 'images': Tensor of shape [C, F, n_view * H, W], the raw video frames.
                 - 'text_emb': Tensor of shape [D], the text embedding associated with the video.
                 - 'actions': Tensor of shape [C_act, F, N, 1], the processed action sequences aligned with the latent frames.
-                - 'actions_mask': Tensor of shape [C_act, F, N, 1], a boolean mask indicating valid action entries.
-                - 'images_mask': Tensor of shape [C, F, H, W], a boolean mask indicating valid image frames.
                 - 'data_timestep': int, the timestep index used for training, indicating how many frames from the start are included in the input.
         """
         idx = idx % len(self.new_metas)
@@ -299,45 +409,49 @@ class LatentLeRobotDataset(LeRobotDataset):
         local_start_frame = start_frame
         local_end_frame = end_frame
 
-        ori_data_dict = self._get_range_latent_data(start_frame, end_frame, episode_index)
+        ori_data_dict = self._get_range_image_data(start_frame, end_frame, episode_index)
 
-        latent_frame_ids = ori_data_dict[f"{self.used_video_keys[0]}.frame_ids"]
+        image_frame_ids = ori_data_dict[f"{self.used_video_keys[0]}.frame_ids"]
         start_frame = self._get_global_idx(episode_index, start_frame)
         end_frame = self._get_global_idx(episode_index, end_frame)
 
         hf_data_frames = self._get_range_hf_data(start_frame, end_frame)
         ori_data_dict.update(hf_data_frames)
-        out_dict = self._cat_video_latents(ori_data_dict)
+        out_dict = self._cat_video_images(ori_data_dict)
 
-        out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'])
+        out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, image_frame_ids, ori_data_dict['action'])
+        out_dict['images'] = out_dict['images'].permute(1, 0, 2, 3) # [C, F, H, W]
 
         window_size = getattr(self.config, 'window_size', 1)
         chunk_size = getattr(self.config, 'chunk_size', 1)
-        num_frames = out_dict['actions'].shape[1]
-        min_t = max(window_size - 1, 0)
-        max_t = max(num_frames - (chunk_size + 1), min_t)
-        if max_t < min_t:
-            data_timestep = min_t if num_frames > 0 else 0
-        else:
-            data_timestep = np.random.randint(min_t, max_t + 1)
-        out_dict['data_timestep'] = int(data_timestep)
+        num_frames_image = out_dict['images'].shape[1]
+        num_frames_act = out_dict['actions'].shape[1]
+        assert num_frames_image == num_frames_act, f"Number of frames in images and actions must be the same, but got {num_frames_image} and {num_frames_act}"
+        out_dict['num_frames'] = num_frames_image
+        # Use action frame nums as chunk_size, instead of image frames
+        # min_t = max(window_size - 1, 0)
+        # max_t = max(num_frames - (chunk_size + 1) // out_dict['actions'].shape[2], min_t)
+        # if max_t < min_t:
+        #     data_timestep = min_t if num_frames > 0 else 0
+        # else:
+        #     data_timestep = np.random.randint(min_t, max_t + 1)
+        # out_dict['data_timestep'] = int(data_timestep)
 
-        window_start = 0
-        window_end = int(data_timestep) + 1
-        image_mask = torch.zeros(num_frames, dtype=torch.bool)
-        action_mask = torch.zeros(num_frames, dtype=torch.bool)
-        image_mask[window_start:window_end] = True
-        action_mask[window_start:window_end - 1] = True
+        # window_start = 0
+        # window_end = int(data_timestep) + 1
+        # image_mask = torch.zeros(num_frames, dtype=torch.bool)
+        # action_mask = torch.zeros(num_frames, dtype=torch.bool)
+        # image_mask[window_start:window_end] = True
+        # action_mask[window_start:window_end - 1] = True
         # expand image_mask and action mask to have the same shape as the data
-        image_mask = image_mask.unsqueeze(0).unsqueeze(2).unsqueeze(3)
-        image_mask = image_mask.expand(out_dict['images'].shape[0], -1, out_dict['images'].shape[2], out_dict['images'].shape[3])
-        action_mask = action_mask.unsqueeze(0).unsqueeze(2).unsqueeze(3)
-        action_mask = action_mask.expand(out_dict['actions'].shape[0], -1, out_dict['actions'].shape[2], out_dict['actions'].shape[3])
+        # image_mask = image_mask.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+        # image_mask = image_mask.expand(out_dict['images'].shape[0], -1, out_dict['images'].shape[2], out_dict['images'].shape[3])
+        # action_mask = action_mask.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+        # action_mask = action_mask.expand(out_dict['actions'].shape[0], -1, out_dict['actions'].shape[2], out_dict['actions'].shape[3])
 
-        out_dict['images_mask'] = image_mask
-        out_dict['actions_mask'] = action_mask
+        # out_dict['images_mask'] = image_mask
+        # out_dict['actions_mask'] = action_mask
 
-        out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2)
         return out_dict
 
     def __len__(self):

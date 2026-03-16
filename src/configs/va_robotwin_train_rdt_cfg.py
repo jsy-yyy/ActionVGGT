@@ -14,14 +14,19 @@ va_robotwin_train_rdt_cfg.update(va_robotwin_train_cfg)
 # -----------------------------------------------------------------------------
 # ActionVGGT encoder checkpoints
 va_robotwin_train_rdt_cfg.transformer_resume_from = None
-va_robotwin_train_rdt_cfg.transformer_pretrained = None
+va_robotwin_train_rdt_cfg.transformer_pretrained = '../ckpt/actionvggt.pth'
 
 # RDT action head checkpoints
 va_robotwin_train_rdt_cfg.action_head_resume_from = None
-va_robotwin_train_rdt_cfg.action_head_pretrained = None
+va_robotwin_train_rdt_cfg.action_head_pretrained = '../ckpt/RDT.pth'
 
+va_robotwin_train_rdt_cfg.image_height = 518
+va_robotwin_train_rdt_cfg.image_width = 518
 va_robotwin_train_rdt_cfg.window_size = 4
-va_robotwin_train_rdt_cfg.chunk_size = 2
+va_robotwin_train_rdt_cfg.chunk_size = 24
+
+va_robotwin_train_rdt_cfg.gradient_checkpointing = False
+va_robotwin_train_rdt_cfg.long_context = False
 
 # -----------------------------------------------------------------------------
 # RDT settings (from RDT2/configs/rdt/post_train.yaml)
@@ -39,3 +44,4 @@ va_robotwin_train_rdt_cfg.rdt.multiple_of = 256
 va_robotwin_train_rdt_cfg.rdt.ffn_dim_multiplier = None
 va_robotwin_train_rdt_cfg.rdt.num_kv_heads = 4
 va_robotwin_train_rdt_cfg.rdt.use_flash_attn = True
+va_robotwin_train_rdt_cfg.rdt.action_dim = va_robotwin_train_rdt_cfg.action_dim
