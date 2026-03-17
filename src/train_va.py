@@ -361,12 +361,12 @@ class Trainer:
         # Replace action grid_id to align with action token RoPE (one token per frame)
         action_grid_id = get_mesh_id(
             F,
-            1,
+            N,
             1,
             t=1,
             f_w=1,
             f_shift=0,
-            action=False,
+            action=True,
         ).to(self.device)
         action_grid_id = action_grid_id[None].repeat(B, 1, 1)
 
@@ -410,7 +410,14 @@ class Trainer:
                 return {k: to_device(v) for k, v in obj.items()}
             return obj
 
-        return to_device(input_dict)
+        def to_dtype(obj):
+            if torch.is_tensor(obj) and obj.dtype in [torch.float32, torch.float16, torch.float, torch.bfloat16]:
+                return obj.to(self.dtype)
+            if isinstance(obj, dict):
+                return {k: to_dtype(v) for k, v in obj.items()}
+            return obj
+
+        return to_dtype(to_device(input_dict))
 
     def compute_loss(self, input_dict, pred):
         action_pred = pred

@@ -262,12 +262,11 @@ class Aggregator(nn.Module):
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}. Image shape: {images.shape}")
 
-        # Normalize images and reshape for patch embed
-        images = (images - self._resnet_mean.to(images.device)) / self._resnet_std.to(images.device)
+        # Normalize images while preserving dtype for mixed-precision runs.
+        images = (images - self._resnet_mean.to(device=images.device, dtype=images.dtype)) / self._resnet_std.to(device=images.device, dtype=images.dtype)
 
         # Reshape to [B*S, C, H, W] for patch embedding
         images = images.reshape(-1, C_in, self.image_height, self.image_width)
-        print(images.shape)
         patch_tokens = self.patch_embed(images)
 
         if isinstance(patch_tokens, dict):
@@ -277,8 +276,9 @@ class Aggregator(nn.Module):
         patch_tokens = patch_tokens.reshape(B * S, -1, C)
 
         # Process action tokens if provided
-        action_vec = rearrange(actions, 'b c f h w -> b (f h w) c')
+        action_vec = rearrange(actions, 'b c f h w -> (b f) (h w) c')
         action_tokens = self.action_embedder(action_vec)
+        # print(f"actions: {actions.shape}, action_vec: {action_vec.shape}, action_tokens: {action_tokens.shape}")
 
         if use_cache:
             camera_token_full = slice_expand_and_flatten(self.camera_token, B, S_true)
@@ -293,6 +293,7 @@ class Aggregator(nn.Module):
         # Interleave tokens temporally
         img_tokens = patch_tokens
         # Concatenate along token dimension for each frame
+        # print(f"Camera token shape: {camera_token.shape}, Register token shape: {register_token.shape}, Image tokens shape: {img_tokens.shape}, Action tokens shape: {action_tokens.shape}")
         tokens = torch.cat([camera_token, register_token, img_tokens, action_tokens], dim=1)
 
         # Build 3D positions from grid_id (f/h/w). If not provided, fall back to 2D positions.
@@ -316,12 +317,8 @@ class Aggregator(nn.Module):
                 else:
                     # action_grid_id expected [B, 4, F*H*W] or [B, 4, F]
                     act_grid = action_grid_id[:, :3]
-                    if act_grid.shape[-1] == S:
-                        act_grid = act_grid.reshape(B, 3, S, 1).permute(0, 2, 3, 1)
-                    else:
-                        act_grid = act_grid.reshape(B, 3, S, -1).permute(0, 2, 3, 1)
-                        act_grid = act_grid[:, :, :1]
-                    action_pos = act_grid.reshape(B * S, 1, 3)
+                    act_grid = act_grid.reshape(B, 3, S, -1).permute(0, 2, 3, 1)
+                    action_pos = act_grid.reshape(B * S, -1, 3)
                 pos = torch.cat([pos, action_pos], dim=1)
 
         self.token_idx["image"] = (self.token_idx["register"][1], self.token_idx["register"][1] + P)

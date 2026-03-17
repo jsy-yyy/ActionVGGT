@@ -103,7 +103,6 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
         timesteps = target_dict.get('timesteps', None) # [B]
         pred_frame_idx = target_dict.get('pred_frame_idx', None) # [B]
 
-        action_grid_id = action_dict.get('grid_id', None)
         if text_emb is None:
             text_emb = action_dict.get('text_emb', None)
 

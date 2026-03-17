@@ -218,6 +218,29 @@ class RotaryPositionEmbedding3D(nn.Module):
         sin = F.embedding(positions, sin_comp)[:, None, :, :]
         return (tokens * cos) + (self._rotate_features(tokens) * sin)
 
+    @staticmethod
+    def _split_even_3d_dims(dim: int) -> Tuple[int, int, int]:
+        """Split feature dim into even (f, h, w) chunks for 3D RoPE.
+
+        RoPE rotation uses pairwise feature channels, so each axis chunk must be even.
+        We keep h/w close to one third and place the remainder on f.
+        """
+        if dim % 2 != 0:
+            raise ValueError(f"Feature dimension must be even for RoPE, got dim={dim}")
+
+        base = (dim // 3) // 2 * 2  # largest even <= dim//3
+        if base == 0:
+            raise ValueError(f"Feature dimension too small for 3D RoPE split, got dim={dim}")
+
+        h_dim = base
+        w_dim = base
+        f_dim = dim - h_dim - w_dim
+
+        if f_dim <= 0 or f_dim % 2 != 0:
+            raise ValueError(f"Invalid 3D RoPE split for dim={dim}: f_dim={f_dim}, h_dim={h_dim}, w_dim={w_dim}")
+
+        return f_dim, h_dim, w_dim
+
     def forward(self, tokens: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Applies 3D rotary position embeddings to input tokens.
 
@@ -233,10 +256,7 @@ class RotaryPositionEmbedding3D(nn.Module):
         positions = positions.clamp_min(0).to(torch.long)
 
         dim = tokens.size(-1)
-        f_dim = dim - 2 * (dim // 3)
-        h_dim = dim // 3
-        w_dim = dim // 3
-        assert f_dim % 2 == 0 and h_dim % 2 == 0 and w_dim % 2 == 0, "RoPE dims must be even"
+        f_dim, h_dim, w_dim = self._split_even_3d_dims(dim)
 
         f_tokens, h_tokens, w_tokens = torch.split(tokens, [f_dim, h_dim, w_dim], dim=-1)
 
