@@ -63,6 +63,18 @@ def get_effective_num_image_views(config):
     raise ValueError(f"Unsupported multi_view_image_mode `{mode}`")
 
 
+def _to_plain_config(value):
+    if isinstance(value, dict):
+        return {str(k): _to_plain_config(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain_config(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, torch.dtype):
+        return str(value)
+    return value
+
+
 class Trainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
@@ -99,6 +111,19 @@ class Trainer:
             rdt_img_pool_size=getattr(config, "rdt_img_pool_size", 1),
             rdt_img_keep_summary_tokens=getattr(config, "rdt_img_keep_summary_tokens", False),
         )
+        self.transformer.config = _to_plain_config({
+            "img_height": config.image_height,
+            "img_width": config.image_width,
+            "patch_size": self.transformer.patch_size,
+            "embed_dim": self.transformer.embed_dim,
+            "action_dim": self.transformer.action_dim,
+            "window_size": self.transformer.window_size,
+            "chunk_size": self.transformer.chunk_size,
+            "num_image_views": self.transformer.num_image_views,
+            "rdt_img_cond_mode": self.transformer.rdt_img_cond_mode,
+            "rdt_img_pool_size": self.transformer.rdt_img_pool_size,
+            "rdt_img_keep_summary_tokens": self.transformer.rdt_img_keep_summary_tokens,
+        })
         logger.info(f"All model parameters: {sum(p.numel() for p in self.transformer.parameters())}")
 
         self.transformer.to(self.device)
@@ -142,6 +167,19 @@ class Trainer:
             max_act_len=self.config.window_size * act_tokens_per_frame,
             dtype=self.dtype,
         )
+        self.action_head.config = _to_plain_config({
+            "horizon": rdt_horizon,
+            "output_size": self.transformer.action_dim,
+            "config": rdt_config,
+            "x_pos_emb_config": rdt_x_pos_emb_config,
+            "lang_pos_emb_config": None,
+            "max_lang_len": 0,
+            "img_pos_emb_config": rdt_img_pos_emb_config,
+            "max_img_len": self.config.window_size * img_tokens_per_frame,
+            "act_pos_emb_config": rdt_act_pos_emb_config,
+            "max_act_len": self.config.window_size * act_tokens_per_frame,
+            "dtype": self.dtype,
+        })
         self.action_head.to(self.device)
 
         if config.long_context:
